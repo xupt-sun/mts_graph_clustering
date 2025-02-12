@@ -6,14 +6,14 @@ MTS clustering.
 import argparse
 import numpy as np
 import multiTS as mts
-import mtsClustering as mts_clust
+import mtsClustering3 as mts_clust
 
 
 def parse_args():
     '''
     Parses arguments.
     '''
-    parser = argparse.ArgumentParser(description="Run mts-clustering.")
+    parser = argparse.ArgumentParser(description="Run mts-clustering-ours.")
 
     parser.add_argument('--input', nargs='?', required=True,
                         help='Input file.')
@@ -21,20 +21,20 @@ def parse_args():
     parser.add_argument('--input_sims', nargs='?', required=True,
                         help='Input file of similarity matrix.')
 
-    parser.add_argument('--clusters', nargs='?', required=True,
-                        help='cluster file.')
+    parser.add_argument('--eks', nargs='?', required=True,
+                        help='Input file of ek.')
 
-    parser.add_argument('--knn', default=3, type=int,
-                        help='for component relation network construction: number of nearest neighbors.')
+    parser.add_argument('--sim_flag', default=0, type=int,
+                        help='0, do not use sim threshold; 1, use.')
 
-    parser.add_argument('--sim_th', default=0.0, type=float,
-                        help='similarity threshold for network construction. if 0.0, not used')
+    parser.add_argument('--combine_flag', default=0, type=int,
+                        help='0, single-layer; 1, combine multi-layer by overlay; 2, combine multi-layer by average.')
 
-    parser.add_argument('--combine_flag', default=2, type=int,
-                        help='1, combine multi-layer by overlay; 2, combine multi-layer by average.')
+    parser.add_argument('--min_layer_num', default=1, type=int,
+                        help='minimum number of layer connections, for overlay combination.')
 
     parser.add_argument('--cd_alg', nargs='?', default="louvain",
-                        help='community detection algorithm: louvain or nmf.')
+                        help='community detection algorithm: louvain, nmf, mnmf, or flpa.')
 
     parser.add_argument('--comnum', default=4, type=int,
                         help='community number (for NMF).')
@@ -47,6 +47,9 @@ def parse_args():
 
     parser.add_argument('--mnmf_reg_lam', default=0.1, type=float,
                         help='regularization parameter for MNMF.')
+
+    parser.add_argument('--clusters', nargs='?', required=True,
+                        help='cluster file.')
 
     return parser.parse_args()
 
@@ -98,6 +101,7 @@ def load_mts():
                 vecs[ix, :] = list(items)
 
             mts_i = mts.MultiTS(mid, label, vecs)
+            mts_i.normalize_zscore()
             mts_data[mid] = mts_i
 
     return mts_data
@@ -190,45 +194,56 @@ def print_coms(coms, graph_id_map):
     return
 
 
-def normalize_sims(mts_sims):
-    mts_sims_norm = np.array(mts_sims)
-    max_sim = 0.0
-    min_sim = np.amin(mts_sims)
-
-    if max_sim != min_sim:
-        mts_sims_norm = (mts_sims_norm - min_sim) / (max_sim - min_sim)
-    else:
-        mts_sims_norm[:] = 1.0
-
-    return mts_sims_norm
-
-
-
-def cluster_mts(mts_data, sim_scores):
+def cluster_mts(mts_data, sim_scores, eks):
     cluster = mts_clust.MtsClustering(mts_data)
 
-    if args.sim_th < 0.5:
-        mts_graph_multilayer, graph_id_map = cluster.build_mts_graph_multilayer_knn(sim_scores, args.knn)
-    else:
-        mts_graph_multilayer, graph_id_map = cluster.build_mts_graph_multilayer_knn_sim(sim_scores, args.knn,
-                                                                                        args.sim_th)
+    if args.combine_flag == 0:
+        # single layer network
+        knn = int(eks[0])
+        sim_th = 0.0
+        if args.sim_flag == 1:
+            sim_th = eks[1]
 
-    if args.cd_alg != 'mnmf':
-        if args.combine_flag == 1:  # overlay combination
-            mts_graph_0 = cluster.combine_multilayer_graphes_overlay(mts_graph_multilayer)
-        elif args.combine_flag == 2:  # average combination
-            sim_scores_norm = normalize_sims(sim_scores)
-            mts_graph_0, graph_id_map = cluster.combine_multilayer_graphes_avg(sim_scores_norm, args.knn, args.sim_th)
-        else:
-            print('Error combine flag.')
-            exit(-1)
-        coms = cluster.cluster_mtsset(mts_graph_0, args.cd_alg, args.comnum, args.nmf_max_it, args.nmf_tol)
-    elif args.cd_alg == 'mnmf':
-        coms = cluster.cluster_mtsset_mnmf(mts_graph_multilayer, args.comnum, args.nmf_max_it, args.nmf_tol,
-                                           args.mnmf_reg_lam)
+        mts_graph, all_same_flag, graph_id_map = cluster.build_mts_graph_knn_sim(sim_scores, knn, sim_th)
+
+        if all_same_flag == 1:
+            print("all similarity scores are same. not necessary.")
+            exit(0)
+
+        coms = cluster.cluster_mtsset(mts_graph, args.cd_alg, args.comnum, args.nmf_max_it, args.nmf_tol)
+
     else:
-        print('Error algorithm: %s' % args.cd_alg)
-        exit(0)
+        ### multi layer network
+        if args.combine_flag == 2:  ### combine by average.
+            knn = int(eks[0])
+            sim_th = 0.0
+            if args.sim_flag == 1:
+                sim_th = eks[1]
+
+            mts_graph, all_same_flag, graph_id_map = cluster.combine_multilayer_graphes_avg(sim_scores,knn, sim_th)
+
+            if all_same_flag == 1:
+                print("all similarity scores are same. not necessary.")
+                exit(0)
+
+            coms = cluster.cluster_mtsset(mts_graph, args.cd_alg, args.comnum, args.nmf_max_it, args.nmf_tol)
+        else:
+            knns = np.array(eks[:, 0]).astype(int)
+            sim_ths = np.zeros(knns.shape)
+            if args.sim_flag == 1:
+                sim_ths = eks[:, 1]
+
+            mts_graphes, all_same_flags, graph_id_map = cluster.build_mts_graph_multilayer_knn_sim(sim_scores, knns, sim_ths)
+
+            if args.combine_flag == 1:  ### combine by overlay
+                mts_graph, graph_id_map = cluster.combine_multilayer_graphes_overlay(mts_graphes, all_same_flags, args.min_layer_num)
+                coms = cluster.cluster_mtsset(mts_graph, args.cd_alg, args.comnum, args.nmf_max_it, args.nmf_tol)
+            elif args.combine_flag == 3:  ### multi-layer
+                coms = cluster.cluster_mtsset_mnmf(mts_graphes, all_same_flags, args.comnum, args.nmf_max_it, args.nmf_tol,
+                                                   args.mnmf_reg_lam)
+            else:
+                print("error combine flag: %d not in [1, 2, 3]")
+                exit(-1)
 
     output_clusters(coms, graph_id_map)
     print_coms(coms, graph_id_map)
@@ -236,14 +251,34 @@ def cluster_mts(mts_data, sim_scores):
     return
 
 
+def normalize_sims(sim_scores):
+    max_sim = np.nanmax(sim_scores)
+    min_sim = np.nanmin(sim_scores)
+
+    if (max_sim - 0.0) > 1e-6:
+        print('Error: has negative distance.')
+        exit(-1)
+
+    if max_sim == np.NaN:
+        print('Error: all scores are NaN.')
+        exit(-1)
+
+    if (max_sim - min_sim) > 1e-6:
+        sims_scores_norm = (sim_scores - min_sim) / (max_sim - min_sim)
+    else:
+        sims_scores_norm = np.where(sim_scores != np.NaN, 1.0, sim_scores)
+
+    return sims_scores_norm
+
+
 def main():
     mts_data = load_mts()
     sim_scores = np.load(args.input_sims)
-    cluster_mts(mts_data, sim_scores)
+    sim_scores_norm = normalize_sims(sim_scores)
+    eks = np.loadtxt(args.eks)
+    cluster_mts(mts_data, sim_scores_norm, eks)
 
 
 if __name__ == "__main__":
     args = parse_args()
     main()
-    
-    print('Done.')

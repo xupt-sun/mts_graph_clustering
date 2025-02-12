@@ -1,15 +1,12 @@
 '''
-MTS clustering based on graph.
+MTS clustering based on Grey Theory.
 
 '''
 
 import argparse
 import numpy as np
 import multiTS as mts
-from ordpy import ordinal_distribution, ordinal_sequence
-# from ordpy import complexity_entropy, weighted_permutation_entropy
-from itertools import permutations
-from gensim.matutils import hellinger
+from tslearn.metrics import dtw, soft_dtw
 import concurrent.futures
 
 
@@ -17,7 +14,7 @@ def parse_args():
     '''
     Parses arguments.
     '''
-    parser = argparse.ArgumentParser(description="Compute HMM distance.")
+    parser = argparse.ArgumentParser(description="Compute DTW distance.")
 
     parser.add_argument('--input', nargs='?', required=True,
                         help='Input file.')
@@ -25,11 +22,14 @@ def parse_args():
     parser.add_argument('--output', nargs='?', required=True,
                         help='save file.')
 
-    parser.add_argument('--emb_len', default=3, type=int,
-                        help='embedding length for ordinal pattern.')
+    parser.add_argument('--ts_type', nargs='?', default="dtw",
+                        help='view of TS: ALL, EACH.')
 
-    parser.add_argument('--delay', default=1, type=int,
-                        help='time delay for ordinal pattern.')
+    parser.add_argument('--dtw_type', nargs='?', default="dtw",
+                        help='type of dtw: dtw, sdtw.')
+
+    parser.add_argument('--gamma', default=1.0, type=float,
+                        help='sdtw parameter: gamma')
 
     return parser.parse_args()
 
@@ -81,112 +81,111 @@ def load_mts():
                 vecs[ix, :] = list(items)
 
             mts_i = mts.MultiTS(mid, label, vecs)
+            mts_i.normalize_zscore()
             mts_data[mid] = mts_i
 
     return mts_data
 
 
-def enumurate_patterns(k):
-    seqs = range(k)
-    patterns = list(permutations(seqs, k))
-
-    return patterns
-
-
-def map_patterns(patterns_list, patterns):
-    labels = []
-
-    for p in patterns:
-        tuple_p = tuple(p)
-        ix = patterns_list.index(tuple_p)
-        labels.append(ix)
-
-    return labels
-
-
-def compute_pair_sim_ord(ixx, jxx, mts_i, mts_j, emb_len, delay):
+def compute_pair_sim_dtw(ixx, jxx, mts_i, mts_j, dtw_type, ts_type):
     mts_shape_i = mts_i.shape
     # mts_shape_j = mts_j.shape
     ts_num = mts_shape_i[0]  # both are same
+    # print('ts_num: %d' % ts_num)
     ts_sims = []
-    patterns_list = enumurate_patterns(emb_len)
-    patterns_num = len(patterns_list)
 
-    for ix in range(ts_num):
-        ### extract permutation patterns
-        patterns_i, dist_i = ordinal_distribution(mts_i[ix, :], dx=emb_len, taux=delay, ordered=True,
-                                                  return_missing=True, tie_precision=6)
-        patterns_j, dist_j = ordinal_distribution(mts_j[ix, :], dx=emb_len, taux=delay, ordered=True,
-                                                  return_missing=True, tie_precision=6)
-        ix_patterns_i = map_patterns(patterns_list, patterns_i)
-        ix_patterns_j = map_patterns(patterns_list, patterns_j)
-        ord_dist_i = np.zeros((patterns_num,))
-        ord_dist_j = np.zeros((patterns_num,))
-
-        for jx in range(patterns_num):
-            ix = ix_patterns_i[jx]
-            ord_dist_i[ix] = dist_i[jx]
-
-            ix = ix_patterns_j[jx]
-            ord_dist_j[ix] = dist_j[jx]
-
-        ### compute sim
-        sim = -hellinger(ord_dist_i, ord_dist_j)
-        ts_sims.append(sim)
+    if ts_type == 'ALL':
+        s1 = mts_i.T
+        s2 = mts_j.T
+        if dtw_type == 'dtw':
+            sim = -dtw(s1, s2)
+        elif dtw_type == 'sdtw':
+            sim = -soft_dtw(s1, s2, gamma=args.gamma)
+        else:
+            print('Error DTW type. %s' % dtw_type)
+            exit(-1)
+        ts_sims = sim
+    elif ts_type == 'EACH':
+        for ix in range(ts_num):
+            s1 = list(mts_i[ix, :])
+            s2 = list(mts_j[ix, :])
+            if dtw_type == 'dtw':
+                sim = -dtw(s1, s2)
+            elif dtw_type == 'sdtw':
+                sim = -soft_dtw(s1, s2, gamma=args.gamma)
+            else:
+                print('Error DTW type. %s' % dtw_type)
+                exit(-1)
+            ts_sims.append(sim)
+    else:
+        print('Error ts_type: ALL or EACH')
+        exit(-1)
 
     return [ixx, jxx, ts_sims]
 
 
-def compute_pair_sim_ord_pl(para):
+def compute_pair_sim_dtw_pl(para):
     ixx = para[0]
     jxx = para[1]
     mts_i = para[2]
     mts_j = para[3]
-    emb_len = para[4]
-    delay = para[5]
+    dtw_type = para[4]
+    ts_type = para[5]
 
-    rst = compute_pair_sim_ord(ixx, jxx, mts_i, mts_j, emb_len, delay)
+    rst = compute_pair_sim_dtw(ixx, jxx, mts_i, mts_j, dtw_type, ts_type)
 
     return rst
 
 
-def compute_pd_sims(mts_objs, emb_len, delay):
+def compute_dtw_sims(mts_objs, dtw_type, ts_type):
     ids = list(mts_objs.keys())
     ids.sort()
     id_num = len(ids)
     attr_num = mts_objs[0].row
+    # print('attr_num: %d' % attr_num)
 
     ### collect mts pairs
-    mts_sims = np.zeros((attr_num, id_num, id_num))
+    if ts_type == 'EACH':
+        mts_sims = np.zeros((attr_num, id_num, id_num))
+    elif ts_type == 'ALL':
+        mts_sims = np.zeros((id_num, id_num))
+    else:
+        print('Error ts_type: ALL or EACH')
+        exit(-1)
+
     mts_pairs = []
 
     for ix in range(id_num - 1):
         mts_i = mts_objs[ids[ix]].mts_org
         for jx in range(ix + 1, id_num):
             mts_j = mts_objs[ids[jx]].mts_org
-            mts_pairs.append([ix, jx, mts_i, mts_j, emb_len, delay])
+            mts_pairs.append([ix, jx, mts_i, mts_j, dtw_type, ts_type])
 
     ### parallel compute
     chunksize = 100
     with concurrent.futures.ProcessPoolExecutor(max_workers=None) as executor:
-        xx_sims = executor.map(compute_pair_sim_ord_pl, mts_pairs, chunksize=chunksize)
+        xx_sims = executor.map(compute_pair_sim_dtw_pl, mts_pairs, chunksize=chunksize)
 
     for rst in xx_sims:
         ixx = rst[0]
         jxx = rst[1]
         val = rst[2]
-
-        for kx in range(attr_num):
-            mts_sims[kx, ixx, jxx] = val[kx]
-            mts_sims[kx, jxx, ixx] = val[kx]
+        # print('ixx=%d, jxx=%d, val_len=%d' % (ixx, jxx, len(val)))
+        if ts_type == 'EACH':
+            for kx in range(attr_num):
+                mts_sims[kx, ixx, jxx] = val[kx]
+                mts_sims[kx, jxx, ixx] = val[kx]
+        elif ts_type == 'ALL':
+            mts_sims[ixx, jxx] = val
+            mts_sims[jxx, ixx] = val
 
     return mts_sims
 
 
 def main():
     mts_data = load_mts()
-
-    mts_sims = compute_pd_sims(mts_data, args.emb_len, args.delay)
+    mts_sims = compute_dtw_sims(mts_data, args.dtw_type, args.ts_type)
+    mts_sims = np.round(mts_sims, 6)
     np.save(args.output, mts_sims)
 
     return
